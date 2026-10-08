@@ -227,7 +227,7 @@ function speak(text){
     if (!RT.tts) return resolve();
     fetch('/api/speak', {method:'POST', headers:apiHeaders({'content-type':'application/json'}),
                          body: JSON.stringify({text:spoken})})
-      .then(r => r.ok ? r.blob() : Promise.reject())
+      .then(r => r.ok ? r.blob() : r.json().catch(() => ({})).then(j => Promise.reject(new Error(j.error || `TTS HTTP ${r.status}`))))
       .then(blob => {
         const url = URL.createObjectURL(blob);
         if (player) player.pause();
@@ -238,13 +238,17 @@ function speak(text){
         player.onended = done; player.onerror = done;
         return player.play();
       })
-      .catch(() => resolve());
+      .catch(e => { log('error','VOICE',`ElevenLabs TTS failed: ${String(e?.message || e).slice(0,160)}`); resolve(); });
   });
 }
 
 // ── start / stop the whole conversation ──
 async function micToggle(){
   if (convo){ stopConvo(); return; }
+  if (RT.stt && RT.voiceBad){
+    log('error','VOICE','ElevenLabs rejected the API key — fix ELEVENLABS_API_KEY in .env, then try again.');
+    return;
+  }
   // Prefer ElevenLabs server-side STT when configured. Browser STT is unreliable
   // across Chrome profiles and often fails silently; ElevenLabs receives the
   // actual microphone recording from MediaRecorder and is much more consistent.
@@ -402,8 +406,10 @@ async function ship(){
   log('voice','VOICE',`uploading ${Math.round(blob.size/1024)}KB to server STT`);
   const t0 = performance.now();
   try {
-    const r = await fetch('/api/listen', {method:'POST',
-      headers:apiHeaders({'content-type':blob.type||'audio/webm'}), body:blob}).then(r=>r.json());
+    const res = await fetch('/api/listen', {method:'POST',
+      headers:apiHeaders({'content-type':blob.type||'audio/webm'}), body:blob});
+    const r = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(r.error || `STT HTTP ${res.status}`);
     const text = (r.text||'').trim();
     const ms = Math.round(performance.now() - t0);
     if (!text){
@@ -421,8 +427,18 @@ async function ship(){
     suppress = false;
     if (convo) beginTurn();
   } catch(e){
-    log('error','VOICE','transcription failed');
+    const msg = String(e?.message || e);
+    log('error','VOICE',`transcription failed: ${msg.slice(0,220)}`);
     suppress = false;
+    // Auth/permission failures never fix themselves: close the mic instead of
+    // re-arming it forever. No silent fallback to browser speech either — the
+    // user configured ElevenLabs, so say what to fix.
+    if (/\bHTTP 40[13]\b|unauthorized|invalid_api_key|missing_permissions/i.test(msg)){
+      stopConvo();
+      setState('error','FAULT','ElevenLabs rejected the key — fix ELEVENLABS_API_KEY in .env');
+      setTag('err','ERROR');
+      return;
+    }
     if (convo) beginTurn(); else setState('error','FAULT','transcription failed');
   }
 }
@@ -510,6 +526,27 @@ function sys(id, val, cls){
   const el = $('#sy-' + id); if (!el) return;
   el.textContent = val; if (cls != null) el.className = cls;
 }
+
+// Voice channel state, applied at boot and refreshed from the /api/jobs poll, so
+// a key pasted into .env after launch (or one ElevenLabs rejects) shows up here
+// within seconds — no page reload, no silent fallback.
+function applyVoice(v){
+  const stt = v.stt==='elevenlabs', tts = v.tts==='elevenlabs';
+  const bad = stt && v.ok===false;
+  const key = `${stt}|${tts}|${v.ok}|${v.error||''}`;
+  const changed = RT.voiceKey !== key; RT.voiceKey = key;
+  RT.stt = stt; RT.tts = tts; RT.voiceBad = bad;
+  const label = `${stt?'ElevenLabs STT':'Browser STT'} / ${tts?'ElevenLabs TTS':'Browser TTS'}`
+              + (bad ? ` · key ${v.error||'rejected'}` : '');
+  const usable = RT.browserStt || stt;
+  sys('voice', label, bad || !usable ? 'warn' : '');
+  $('#top-voice').textContent = 'Voice: ' + label;
+  $('#top-voice').parentElement.className = 'pill ' + (bad || !usable ? 'warn' : 'ok');
+  if (!convo) $('#mic').textContent = stt ? '◉ ElevenLabs Voice' : '◉ Browser Voice';
+  if (!changed) return;
+  if (bad) log('error','VOICE',`ElevenLabs rejected the API key (${v.error}). Fix ELEVENLABS_API_KEY in .env — the server reloads it automatically.`);
+  else log('voice','VOICE',`channel ready — ${label}`);
+}
 // live clock in the system panel
 setInterval(() => sys('clock', now()), 1000);
 
@@ -517,6 +554,7 @@ setInterval(() => sys('clock', now()), 1000);
 setInterval(async () => {
   try {
     const j = await fetch('/api/jobs', {headers:apiHeaders()}).then(r => r.json());
+    if (j.voice) applyVoice(j.voice);
     for (const d of (j.done || [])){
       log('complete','MISSION', `${d.mission} → ${(d.result||'').slice(0,200)}`);
       if (!running) speak(`Mission complete. ${(d.result||'').slice(0,300)}`);
@@ -529,26 +567,22 @@ setInterval(async () => {
   defaultTip = $('#tip').textContent;
   try {
     const s = await fetch('/api/status').then(r=>r.json());
-    RT.tts = s.tts==='elevenlabs'; RT.stt = s.stt==='elevenlabs';
     RT.browserStt = !!SpeechRecognition; RT.browserTts = !!speechSynth;
 
     const port = location.port || '8730';
     sys('gw', `online · :${port}`, 'ok');
     sys('brain', s.runtime === 'hermes' ? 'Hermes Agent' : 'Hermes offline', s.runtime === 'hermes' ? 'ok' : 'warn');
-    sys('voice', `${RT.stt?'ElevenLabs STT':'Browser STT'} / ${RT.tts?'ElevenLabs TTS':'Browser TTS'}`, (RT.browserStt||RT.stt) ? '' : 'warn');
     sys('profile', s.profile || 'default');
     sys('runtime', s.runtime || '—', s.runtime === 'hermes' ? 'ok' : 'warn');
     sys('clock', now());
     $('#top-gw').textContent = `Gateway: online ${location.origin}`;
     $('#top-profile').textContent = 'Profile: ' + (s.profile || 'default');
-    $('#top-voice').textContent = 'Voice: ' + (RT.stt ? 'ElevenLabs STT' : (RT.browserStt ? 'browser STT' : s.stt)) + ' / ' + (RT.tts ? 'ElevenLabs TTS' : 'browser TTS');
+    applyVoice({stt:s.stt, tts:s.tts, ok:s.voice_ok, error:s.voice_error});
     const tools = (s.tools || []).slice(0, 12);
     $('#toolsList').innerHTML = tools.length ? tools.map(t => `<span class="chip">${esc(t)}</span>`).join('') : '<span class="chip ghost">Hermes tool list unavailable — set HERMES_CMD if needed</span>';
 
     log('status', 'BOOT',
         `gateway online · ${s.runtime} core · profile=${s.profile || 'default'} · permission=${s.permission}`);
-    log('voice', 'VOICE', `channel ready — ${RT.stt ? 'ElevenLabs STT' : (RT.browserStt ? 'browser STT' : s.stt)} / ${RT.tts ? 'ElevenLabs TTS' : 'browser TTS'}`);
-    $('#mic').textContent = RT.stt ? '◉ ElevenLabs Voice' : '◉ Browser Voice';
     setState('', 'STANDBY', 'awaiting uplink');
   } catch(e){
     sys('gw','offline','warn');

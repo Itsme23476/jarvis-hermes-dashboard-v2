@@ -14,7 +14,10 @@ import urllib.request
 
 # Rachel — calm, British-adjacent. Override with ELEVENLABS_VOICE_ID.
 DEFAULT_VOICE = "21m00Tcm4TlvDq8ikWAM"
-MODEL = os.environ.get("ELEVENLABS_MODEL", "eleven_turbo_v2_5")
+
+
+def model():
+    return os.environ.get("ELEVENLABS_MODEL", "eleven_turbo_v2_5")
 
 
 def available():
@@ -23,6 +26,39 @@ def available():
 
 def voice_id():
     return os.environ.get("ELEVENLABS_VOICE_ID", DEFAULT_VOICE)
+
+
+def _reason(e):
+    """ElevenLabs' machine-readable status from an HTTPError — never the key."""
+    try:
+        detail = json.loads(e.read(600)).get("detail", {})
+        if isinstance(detail, dict):
+            return str(detail.get("status") or detail.get("message") or f"http_{e.code}")[:80]
+        return str(detail)[:80]
+    except Exception:                                      # noqa: BLE001
+        return f"http_{e.code}"
+
+
+def verify():
+    """Cheap check that ElevenLabs accepts the key. Returns (ok, detail).
+
+    detail is the subscription tier when ok, otherwise ElevenLabs' status such as
+    'invalid_api_key' or 'missing_permissions'. The key itself is never returned,
+    so this is safe to show in the banner, /api/status and the HUD.
+    """
+    if not available():
+        return False, "no_key"
+    req = urllib.request.Request(
+        "https://api.elevenlabs.io/v1/user/subscription",
+        headers={"xi-api-key": os.environ["ELEVENLABS_API_KEY"]},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return True, str(json.loads(r.read()).get("tier", "ok"))
+    except urllib.error.HTTPError as e:
+        return False, _reason(e)
+    except Exception as e:                                 # noqa: BLE001
+        return False, f"network: {str(e)[:60]}"
 
 
 def speak(text):
@@ -37,7 +73,7 @@ def speak(text):
         f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id()}",
         data=json.dumps({
             "text": text[:2500],
-            "model_id": MODEL,
+            "model_id": model(),
             "voice_settings": {
                 "stability": 0.42,          # a little variation; 0.5+ goes flat
                 "similarity_boost": 0.85,
@@ -52,8 +88,11 @@ def speak(text):
             "xi-api-key": os.environ["ELEVENLABS_API_KEY"],
         },
     )
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return r.read()
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.read()
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"ElevenLabs TTS HTTP {e.code}: {_reason(e)}") from e
 
 
 def transcribe(audio, mime="audio/webm"):
@@ -91,8 +130,12 @@ def transcribe(audio, mime="audio/webm"):
             "xi-api-key": os.environ["ELEVENLABS_API_KEY"],
         },
     )
-    with urllib.request.urlopen(req, timeout=45) as r:
-        return (json.loads(r.read()).get("text") or "").strip()
+    try:
+        with urllib.request.urlopen(req, timeout=45) as r:
+            return (json.loads(r.read()).get("text") or "").strip()
+    except urllib.error.HTTPError as e:
+        # Surface auth/quota problems to the HUD by status code, never the key.
+        raise RuntimeError(f"ElevenLabs STT HTTP {e.code}: {_reason(e)}") from e
 
 
 def voices():

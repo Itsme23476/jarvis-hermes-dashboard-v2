@@ -8,6 +8,7 @@ configured tools, browser/Chrome automation, MCP servers, skills, memory, and
 third-party integrations that your normal Hermes sessions have. Voice can use the
 browser Web Speech API, with optional server-side ElevenLabs STT/TTS if present.
 """
+import errno
 import json
 import mimetypes
 import os
@@ -22,14 +23,43 @@ from urllib.parse import urlparse
 ROOT = pathlib.Path(__file__).resolve().parent
 UI = ROOT / "ui"
 
-# load .env before importing anything that reads os.environ
-_env = ROOT / ".env"
-if _env.exists():
-    for line in _env.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
+# .env handling. Real environment variables always win. Values that came from
+# the file are refreshed whenever the file changes, so a key pasted into .env
+# after launch takes effect on the next request — no restart, and no stale key
+# held in memory for a week by a launchd/systemd-managed process.
+_ENV_FILE = ROOT / ".env"
+_ENV = {"mtime": None, "keys": set()}
+_ENV_LOCK = threading.Lock()
+
+
+def load_env():
+    """(Re)load .env if it changed since the last call. Returns True on change."""
+    with _ENV_LOCK:
+        try:
+            mtime = _ENV_FILE.stat().st_mtime
+        except FileNotFoundError:
+            return False
+        if mtime == _ENV["mtime"]:
+            return False
+        _ENV["mtime"] = mtime
+        seen = set()
+        for line in _ENV_FILE.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
             k, _, v = line.partition("=")
-            os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+            k, v = k.strip(), v.strip().strip('"').strip("'")
+            if k in os.environ and k not in _ENV["keys"]:
+                continue                    # set by the real environment: keep it
+            os.environ[k] = v
+            seen.add(k)
+        for k in _ENV["keys"] - seen:       # removed from the file
+            os.environ.pop(k, None)
+        _ENV["keys"] = seen
+        return True
+
+
+load_env()
 
 import commands         # noqa: E402
 import runtime          # noqa: E402
@@ -56,6 +86,16 @@ def persona():
     return "\n\n".join(x for x in (base, extra) if x)
 # One continuing Hermes conversation until the user hits /new.
 SESSION = {"id": None}
+
+# Does ElevenLabs actually accept the configured key? Checked at startup and
+# again whenever .env changes — never per request. A rejected key used to look
+# like "voice does nothing"; now the banner, /api/status and the HUD all say so.
+VOICE = {"ok": False, "detail": "no_key"}
+
+
+def check_voice():
+    VOICE["ok"], VOICE["detail"] = voice.verify()
+    return VOICE
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -107,6 +147,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if not self._host_ok():
             return self._json({"error": "invalid host"}, 403)
+        if load_env():
+            check_voice()
         p = urlparse(self.path).path
         if p == "/api/status":
             return self._json(dict(
@@ -123,6 +165,8 @@ class Handler(BaseHTTPRequestHandler):
                 voice_id=voice.voice_id() if voice.available() else "browser",
                 stt="elevenlabs" if voice.available() else "browser",
                 tts="elevenlabs" if voice.available() else "browser",
+                voice_ok=VOICE["ok"],
+                voice_error=None if VOICE["ok"] else VOICE["detail"],
                 session=SESSION["id"]))
         if p == "/api/jobs":
             if not self._token_ok():
@@ -130,7 +174,13 @@ class Handler(BaseHTTPRequestHandler):
             # finished background missions, reported once each
             return self._json(dict(done=commands.take_finished(),
                                    running=[j for j in commands.jobs_snapshot()
-                                            if j["status"] == "running"]))
+                                            if j["status"] == "running"],
+                                   # piggy-back the voice state so the HUD can
+                                   # reflect a key pasted into .env after launch
+                                   voice=dict(stt="elevenlabs" if voice.available() else "browser",
+                                              tts="elevenlabs" if voice.available() else "browser",
+                                              ok=VOICE["ok"],
+                                              error=None if VOICE["ok"] else VOICE["detail"])))
 
         rel = "index.html" if p == "/" else p.lstrip("/")
         f = (UI / rel).resolve()
@@ -149,6 +199,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"error": "request origin rejected"}, 403)
         if not self._token_ok():
             return self._json({"error": "unauthorized"}, 401)
+        if load_env():
+            check_voice()
         ctype = self.headers.get("Content-Type", "").split(";", 1)[0].lower()
         if p in {"/api/run", "/api/speak", "/api/new", "/api/cancel"} and ctype != "application/json":
             return self._json({"error": "application/json required"}, 415)
@@ -171,7 +223,7 @@ class Handler(BaseHTTPRequestHandler):
                 mime = self.headers.get("Content-Type", "audio/webm")
                 return self._json({"text": voice.transcribe(raw, mime)})
             except Exception as e:                        # noqa: BLE001
-                return self._json({"error": str(e)[:300], "text": ""}, 503)
+                return self._json({"error": str(e)[:600], "text": ""}, 503)
 
         if p == "/api/new":
             runtime.cancel_active()
@@ -260,8 +312,14 @@ def main():
     kind = runtime.runtime_kind()
     brain = ("Hermes Agent (profile tools, skills, memory, MCP, browser integrations live)"
              if kind == "hermes" else "MOCK — Hermes CLI not reachable")
-    vo = (f"ElevenLabs · {voice.voice_id()[:8]}…" if voice.available()
-          else "none (add ELEVENLABS_API_KEY for voice)")
+    check_voice()
+    if VOICE["ok"]:
+        vo = f"ElevenLabs · {voice.voice_id()[:8]}… · key accepted (tier: {VOICE['detail']})"
+    elif voice.available():
+        vo = (f"ElevenLabs key REJECTED ({VOICE['detail']}) — fix ELEVENLABS_API_KEY in .env; "
+              "the file is reloaded automatically")
+    else:
+        vo = "browser speech only — add ELEVENLABS_API_KEY to .env for ElevenLabs (no restart needed)"
     perm = runtime.PERMISSION
     perm_note = ("  can run tools without asking — set JARVIS_PERMISSION=default to require approval"
                  if perm == "bypass" else "")
@@ -273,11 +331,19 @@ def main():
   profile      {runtime.PROFILE}
   workdir      {runtime.WORKDIR}
   permission   {perm}{perm_note}
-  voice        {vo} + browser Web Speech fallback
+  voice        {vo}
   open         http://localhost:{PORT}
 """, flush=True)
 
-    srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    try:
+        srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    except OSError as e:
+        if e.errno == errno.EADDRINUSE:
+            print(f"  port {PORT} is already in use — JARVIS is probably running at http://127.0.0.1:{PORT}\n"
+                  f"  Stop it with ./start.sh --stop, or pick another port with JARVIS_PORT.",
+                  file=sys.stderr, flush=True)
+            sys.exit(2)
+        raise
     if os.environ.get("JARVIS_OPEN", "1") != "0":
         webbrowser.open(f"http://localhost:{PORT}")
     try:
